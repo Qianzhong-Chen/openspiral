@@ -5,7 +5,7 @@ real-robot self-improvement framework that turns dense progress rewards into a s
 data flywheel for vision-language-action (VLA) policies.
 
 This package implements the **SPIRAL** half of the paper
-[*SARM2: Multi-Task Stage Aware Reward Modeling for Self Improving Robotic Manipulation*](https://qianzhong-chen.github.io/sarm.github.io/). It is built directly on top of [openpi](https://github.com/Physical-Intelligence/openpi)
+[*SARM2: Multi-Task Stage Aware Reward Modeling for Self Improving Robotic Manipulation*](https://qianzhong-chen.github.io/sarm2.github.io/). It is built directly on top of [openpi](https://github.com/Physical-Intelligence/openpi)
 by [Physical Intelligence](https://www.physicalintelligence.company/) — the π₀ / π₀.₅ flow-matching VLAs
 serve as the frozen base policy that SPIRAL refines. The companion **SARM2** reward model (which produces
 the dense rewards consumed here) lives in the parent [`sarm`](../) repository.
