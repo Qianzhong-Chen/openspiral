@@ -201,11 +201,18 @@ class ResidualActor(nnx.Module):
 # ---------------------------------------------------------------------------
 
 class CriticMLP(nnx.Module):
-    """Single Q-network: maps (features, noise, action) -> scalar Q-value."""
+    """Single Q-network: maps (features, action) -> scalar Q-value.
+
+    The critic is a value function Q(s, a) of the *realized* action. The flow
+    latent z that produced the action carries no information about the value
+    beyond the action itself, so it is deliberately NOT a critic input. (The
+    actor still takes z, since the residual must know which base proposal it is
+    correcting.)
+    """
 
     def __init__(self, config: ResidualRLConfig, *, rngs: nnx.Rngs):
-        # Input: features + flattened noise + flattened action
-        in_dim = config.feature_dim + config.flat_action_dim + config.flat_action_dim
+        # Input: features + flattened action
+        in_dim = config.feature_dim + config.flat_action_dim
         self.mlp = MLPBlock(
             in_dim=in_dim,
             hidden_dims=config.critic_hidden_dims,
@@ -216,10 +223,9 @@ class CriticMLP(nnx.Module):
     def __call__(
         self,
         features: at.Float[at.Array, "b f"],
-        noise_flat: at.Float[at.Array, "b n"],
         action_flat: at.Float[at.Array, "b a"],
     ) -> at.Float[at.Array, "b 1"]:
-        x = jnp.concatenate([features, noise_flat, action_flat], axis=-1)
+        x = jnp.concatenate([features, action_flat], axis=-1)
         return self.mlp(x)
 
 
@@ -240,7 +246,6 @@ class CriticEnsemble(nnx.Module):
     def __call__(
         self,
         features: at.Float[at.Array, "b f"],
-        noise_flat: at.Float[at.Array, "b n"],
         action_flat: at.Float[at.Array, "b a"],
     ) -> at.Float[at.Array, "nq b 1"]:
         """Forward pass through all critics.
@@ -249,7 +254,7 @@ class CriticEnsemble(nnx.Module):
             q_values: (num_critics, B, 1) Q-values from each critic.
         """
         q_values = jnp.stack(
-            [critic(features, noise_flat, action_flat) for critic in self.critics],
+            [critic(features, action_flat) for critic in self.critics],
             axis=0,
         )
         return q_values
@@ -257,11 +262,10 @@ class CriticEnsemble(nnx.Module):
     def min_q(
         self,
         features: at.Float[at.Array, "b f"],
-        noise_flat: at.Float[at.Array, "b n"],
         action_flat: at.Float[at.Array, "b a"],
     ) -> at.Float[at.Array, "b 1"]:
         """Minimum Q-value across ensemble (conservative estimate)."""
-        q_all = self(features, noise_flat, action_flat)  # (N_Q, B, 1)
+        q_all = self(features, action_flat)  # (N_Q, B, 1)
         return jnp.min(q_all, axis=0)  # (B, 1)
 
 
@@ -304,13 +308,14 @@ def critic_loss(
     flat_action_dim = actions.shape[1] * actions.shape[2]
     action_flat = actions.reshape(B, flat_action_dim)
 
-    # Noise = zeros for dataset actions (we don't know the original latent)
-    zero_noise = jnp.zeros((B, flat_action_dim))
-
-    # Q predictions for dataset actions from all critics
-    q_pred_all = critic(features, zero_noise, action_flat)  # (N_Q, B, 1)
+    # Q predictions for dataset actions from all critics. Q(s, a) does not depend
+    # on the latent z that generated the action, so the (unknown) dataset latent
+    # is irrelevant here.
+    q_pred_all = critic(features, action_flat)  # (N_Q, B, 1)
 
     # --- Compute target Q ---
+    # next_noise is the latent z' that produced next_base_actions; the actor
+    # still needs it to know which base proposal it is correcting.
     next_noise_flat = next_noise.reshape(B, flat_action_dim)
 
     # Residual actions for next state (stop gradient - don't train actor through critic loss)
@@ -319,7 +324,7 @@ def critic_loss(
     total_actions_next_flat = total_actions_next.reshape(B, flat_action_dim)
 
     # Target Q from target critic ensemble (min over ensemble)
-    target_q = target_critic.min_q(next_features, next_noise_flat, total_actions_next_flat)  # (B, 1)
+    target_q = target_critic.min_q(next_features, total_actions_next_flat)  # (B, 1)
     target_q = jax.lax.stop_gradient(target_q)
 
     # TD target: R_chunk + gamma^H * (1 - done) * Q_target
@@ -380,7 +385,7 @@ def actor_loss(
     total_actions_flat = total_actions.reshape(BK, flat_action_dim)
 
     # Q-values for total actions (min over ensemble): (B*K, 1)
-    q_values = critic.min_q(features_expanded, noise_k_flat, total_actions_flat)
+    q_values = critic.min_q(features_expanded, total_actions_flat)
     q_values = q_values.reshape(B, K)  # (B, K)
 
     # RL loss: maximize Q-values (average over K samples)
@@ -396,7 +401,7 @@ def actor_loss(
 
     # Filtered BC loss: disable BC when residual-edited action has higher Q than base
     base_actions_flat = base_actions_k.reshape(BK, flat_action_dim)
-    q_base = critic.min_q(features_expanded, noise_k_flat, base_actions_flat)
+    q_base = critic.min_q(features_expanded, base_actions_flat)
     q_base = jax.lax.stop_gradient(q_base.reshape(B, K))
     improvement = q_values - q_base  # (B, K)
     bc_mask = jnp.where(improvement > 0, 0.0, 1.0)
@@ -494,7 +499,7 @@ def best_of_n_actions(
     total_actions_flat = total_actions.reshape(B * K, flat_action_dim)
 
     # Q-values: min over ensemble
-    q_values = critic.min_q(features_expanded, noise_flat, total_actions_flat)  # (B*K, 1)
+    q_values = critic.min_q(features_expanded, total_actions_flat)  # (B*K, 1)
     q_values = q_values.reshape(B, K)  # (B, K)
 
     # Select best per batch element
